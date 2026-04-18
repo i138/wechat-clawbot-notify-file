@@ -1,6 +1,6 @@
 # WeChat ClawBot Notify
 
-一个 AI Agent Skill，让你的 AI 助手能够通过微信 ClawBot 给你发送通知消息。
+一个  Workbuddy AI Agent Skill，让你的 AI 助手能够通过微信 ClawBot 给你发送通知消息。
 
 当 AI 完成自动化任务后，会自动通过微信通知你结果，即使你不在电脑前也不会错过重要信息。
 
@@ -28,11 +28,7 @@ AI 助手 → ClawBot iLink API → 微信 ClawBot → 你的微信
 将本项目克隆到你的 Skill 目录下：
 
 ```bash
-# Claude Code 用户
 git clone https://github.com/plustar35/wechat-clawbot-notify.git ~/.claude/skills/wechat-clawbot-notify
-
-# Cursor 用户
-git clone https://github.com/plustar35/wechat-clawbot-notify.git ~/.cursor/skills/wechat-clawbot-notify
 ```
 
 ### 第二步：初始化配置
@@ -40,12 +36,13 @@ git clone https://github.com/plustar35/wechat-clawbot-notify.git ~/.cursor/skill
 安装完成后，在 AI 助手中输入以下指令触发初始化：
 
 ```
-帮我初始化微信通知
+/wechat-clawbot-notify 帮我初始化微信通知
 ```
 
 AI 助手会自动执行以下操作：
+
 1. 检查 WorkBuddy 中的 ClawBot 配置是否正确
-2. 尝试获取 `context_token`（这一步可能需要等待约 35 秒）
+2. 尝试获取 `context_token`（这一步可能需要等待几秒钟）
 
 如果提示 "No messages with context_token found"，说明需要进入第三步。
 
@@ -72,16 +69,18 @@ AI 助手会重新获取 token，并发送一条验证消息到你的微信：
 你也可以主动触发通知，对 AI 助手说：
 
 ```
-发微信通知：明天上午 10 点有会议
+明天上午 10 点微信提醒我有会议
 ```
 
 ## 命令参考
 
-| 命令 | 说明 |
-|---|---|
-| `send "消息内容"` | 发送文本消息到微信 |
-| `refresh` | 刷新 context_token |
-| `status` | 查看当前配置和 token 状态 |
+
+| 命令            | 说明               |
+| ------------- | ---------------- |
+| `send "消息内容"` | 发送文本消息到微信        |
+| `refresh`     | 刷新 context_token |
+| `status`      | 查看当前配置和 token 状态 |
+
 
 手动调用示例：
 
@@ -98,13 +97,15 @@ python3 scripts/send_wechat.py status
 
 ## 故障排查
 
-| 问题 | 解决方法 |
-|---|---|
-| 提示 "ClawBot channel is not enabled" | 打开 WorkBuddy 设置，确认已开启微信 ClawBot 通道 |
+
+| 问题                                        | 解决方法                               |
+| ----------------------------------------- | ---------------------------------- |
+| 提示 "ClawBot channel is not enabled"       | 打开 WorkBuddy 设置，确认已开启微信 ClawBot 通道 |
 | 提示 "No messages with context_token found" | 打开微信给 ClawBot 发一条消息，然后执行 `refresh` |
-| 消息发送失败 | 执行 `refresh` 获取新的 token 后重试 |
-| 提示 "HTTP 401" | 检查 WorkBuddy 设置中的 botToken 是否正确 |
-| 提示 "Cannot read WorkBuddy settings" | 确认已安装 WorkBuddy 且配置文件存在 |
+| 消息发送失败                                    | 执行 `refresh` 获取新的 token 后重试        |
+| 提示 "HTTP 401"                             | 检查 WorkBuddy 设置中的 botToken 是否正确    |
+| 提示 "Cannot read WorkBuddy settings"       | 确认已安装 WorkBuddy 且配置文件存在            |
+
 
 ## 项目结构
 
