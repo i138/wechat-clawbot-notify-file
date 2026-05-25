@@ -15,10 +15,12 @@ AI 助手 → ClawBot iLink API → 微信 ClawBot → 你的微信
 3. **发送消息**：使用缓存的 token，通过 `/ilink/bot/sendmessage` 接口发送消息到你的微信
 4. **自动重试**：发送失败时自动刷新 token 并重试一次
 
+配置读取会优先使用新的 WorkBuddy 配置文件位置（macOS/Linux: `~/.workbuddy/settings.json`，Windows: `%USERPROFILE%\.workbuddy\settings.json`），再回退到旧版应用配置目录。
+
 ## 前置条件
 
-- macOS 系统
-- 已安装 Python 3
+- 支持 macOS / Windows / Linux
+- 已安装 Python 3，并确保 `python` 命令可用且指向 Python 3
 - 已安装 [WorkBuddy](https://workbuddy.ai) 并在设置中开启了微信 ClawBot 通道
 
 ## 使用指南
@@ -45,6 +47,8 @@ AI 助手会自动执行以下操作：
 2. 尝试获取 `context_token`（这一步可能需要等待几秒钟）
 
 如果提示 "No messages with context_token found"，说明需要进入第三步。
+
+注意：`.token_cache.json` 文件存在不代表已经可以发送消息。该文件可能只保存 `get_updates_buf` 游标；只有 `status` 输出 `Ready: True` 且显示 `Token:` 前缀时，才表示已经缓存了可用于发送的 `context_token`。
 
 ### 第三步：给微信 ClawBot 发送一条消息完成链接
 
@@ -86,13 +90,13 @@ AI 助手会重新获取 token，并发送一条验证消息到你的微信：
 
 ```bash
 # 发送消息
-python3 scripts/send_wechat.py send "任务完成：报告已生成"
+python scripts/send_wechat.py send "任务完成：报告已生成"
 
 # 刷新 token
-python3 scripts/send_wechat.py refresh
+python scripts/send_wechat.py refresh
 
 # 查看状态
-python3 scripts/send_wechat.py status
+python scripts/send_wechat.py status
 ```
 
 ## 故障排查
@@ -114,7 +118,7 @@ wechat-clawbot-notify/
   SKILL.md                  # Skill 描述文件（AI 助手读取此文件了解如何使用）
   scripts/
     send_wechat.py          # 核心脚本：发送消息、刷新 token、查看状态
-    inject_soul.sh          # 将自动通知指令写入 SOUL.md
+    inject_soul.py          # 将自动通知指令写入 SOUL.md（跨平台）
   .gitignore
   README.md
 ```

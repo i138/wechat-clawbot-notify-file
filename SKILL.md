@@ -5,40 +5,52 @@ description_zh: "通过微信 ClawBot 发送通知消息给用户"
 description_en: "Send notification messages to user's WeChat via ClawBot"
 version: 1.2.0
 allowed-tools: Bash,Read
-compatibility: Requires macOS with python3. Reads config from WorkBuddy settings.json.
+compatibility: macOS / Windows / Linux. Requires Python 3. Reads config from WorkBuddy settings.json.
 metadata:
   version: "1.2.0"
   openclaw:
     emoji: "\U0001F4AC"
     requires:
       bins:
-        - python3
+        - python
 ---
 
 # WeChat ClawBot Notify
 
 通过微信 ClawBot iLink API 发送文本消息给用户。
 
+> **平台说明**：统一使用 `python` 执行脚本。macOS/Linux/Bash 使用 `$SKILL_DIR/scripts/...`；Windows PowerShell 使用 `$env:SKILL_DIR\scripts\...`。要求 `python` 指向 Python 3。
+
 ## 初始化检查（必须优先执行）
 
-**使用任何命令前，先检查 `$SKILL_DIR/.token_cache.json` 是否存在。**
-
-- **文件存在** → 技能已就绪，直接跳到 [发送消息](#发送消息)。
-- **文件不存在** → 首次使用，按以下步骤**依次执行**。
+**使用任何命令前，先执行 `status` 检查配置和 token 状态。不要只根据 `.token_cache.json` 是否存在判断技能已就绪；该文件可能只有 `get_updates_buf` 游标，没有可发送消息的 `context_token`。**
 
 ### 第 1 步：检查 ClawBot 配置
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" status
+python "$SKILL_DIR/scripts/send_wechat.py" status
 ```
 
-- **成功** → 进入第 2 步。
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" status
+```
+
+- **输出 `Ready: True` 且 `Token:` 显示 token 前缀** → 技能已就绪，直接跳到 [发送消息](#发送消息)。
+- **输出 `Ready: False` 或 `Token: Not cached`** → 进入第 2 步。
 - **报错** → ClawBot 未配置。告诉用户："请先在 WorkBuddy 设置中连接你的微信 ClawBot 通道。" 到此停止。
 
 ### 第 2 步：获取 context_token
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" refresh
+python "$SKILL_DIR/scripts/send_wechat.py" refresh
+```
+
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" refresh
 ```
 
 - **成功**（输出 "Token refreshed successfully"）→ 进入第 3 步。
@@ -46,16 +58,28 @@ python3 "$SKILL_DIR/scripts/send_wechat.py" refresh
 
 ### 第 3 步：配置自动通知
 
+macOS / Linux / Bash:
 ```bash
-bash "$SKILL_DIR/scripts/inject_soul.sh"
+python "$SKILL_DIR/scripts/inject_soul.py"
+```
+
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\inject_soul.py"
 ```
 
 将自动通知指令写入 `~/.workbuddy/SOUL.md`，后续自动化任务完成后会自动使用本技能通知用户。幂等操作，可重复执行。
 
 ### 第 4 步：发送验证消息
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" send "微信 ClawBot 通知技能配置完成！后续自动化任务完成后会自动通知你的微信。"
+python "$SKILL_DIR/scripts/send_wechat.py" send "微信 ClawBot 通知技能配置完成！后续自动化任务完成后会自动通知你的微信。"
+```
+
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" send "微信 ClawBot 通知技能配置完成！后续自动化任务完成后会自动通知你的微信。"
 ```
 
 - **成功** → 告诉用户："配置完成！验证消息已发送到你的微信，后续自动化任务会自动通知你。"
@@ -65,44 +89,42 @@ python3 "$SKILL_DIR/scripts/send_wechat.py" send "微信 ClawBot 通知技能配
 
 ## 发送消息
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" send "消息内容"
+python "$SKILL_DIR/scripts/send_wechat.py" send "消息内容"
+```
+
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" send "消息内容"
 ```
 
 ## 其他命令
 
 ### 查看状态
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" status
+python "$SKILL_DIR/scripts/send_wechat.py" status
+```
+
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" status
 ```
 
 ### 刷新 token
 
 发送失败时，刷新缓存的 token：
 
+macOS / Linux / Bash:
 ```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" refresh
+python "$SKILL_DIR/scripts/send_wechat.py" refresh
 ```
 
-## 在自动化任务中使用
-
-自动化任务完成后，发送简要的结果摘要：
-
-```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" send "任务完成：<结果摘要>"
-```
-
-## 示例
-
-**每日简报通知：**
-```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" send "每日简报：今天 3 个会议，5 个待办任务。"
-```
-
-**充电提醒：**
-```bash
-python3 "$SKILL_DIR/scripts/send_wechat.py" send "充电提醒：该给设备充电了！"
+Windows PowerShell:
+```powershell
+python "$env:SKILL_DIR\scripts\send_wechat.py" refresh
 ```
 
 ## 故障排查
@@ -111,6 +133,7 @@ python3 "$SKILL_DIR/scripts/send_wechat.py" send "充电提醒：该给设备充
 |---|---|
 | `.token_cache.json` 不存在 | 按上面的初始化步骤执行 |
 | "No cached context_token" | 用户给 ClawBot 发一条消息，然后执行 `refresh` |
+| "getupdates returned ret=-14" | 旧缓存 cursor 或旧 ClawBot 配置失效；脚本会自动丢弃 cursor 重试。仍失败时，让用户给 ClawBot 再发一条消息后执行 `refresh` |
 | 发送静默失败 | 执行 `refresh` 获取新的 token |
 | "HTTP 401" | 检查 WorkBuddy 设置中的 botToken |
 

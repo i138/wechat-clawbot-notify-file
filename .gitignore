@@ -1,3 +1,5 @@
 .token_cache.json
 logs/
 .DS_Store
+__pycache__/
+*.pyc
