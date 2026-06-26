@@ -1,175 +1,106 @@
 #!/usr/bin/env python3
 """
-WeChat ClawBot Message Sender via iLink API.
+WeChat ClawBot Notify — single entry point for agent/LLM.
 
 Usage:
-    send_wechat.py send "消息内容"          # 发送文本消息
-    send_wechat.py refresh                  # 刷新 context_token
-    send_wechat.py status                   # 查看当前 token 状态
+    send_wechat.py setup                      # One-time init
+    send_wechat.py send "text"                # Send text message
+    send_wechat.py sendfile "/path/to/file"   # Send file
+    send_wechat.py status                     # Check config & token
+    send_wechat.py refresh                    # Refresh context_token
 
-Configuration is read from WorkBuddy settings.json automatically.
-context_token is cached to ~/.workbuddy/skills/wechat-clawbot-notify/.token_cache.json
+Add --json before the command for structured JSON output (agent-friendly).
 """
 
-import json
-import os
-import sys
-import time
-import uuid
-import base64
-import urllib.request
-import urllib.error
+import json, os, sys, time, uuid, base64, hashlib, urllib.request, urllib.error
+from urllib.parse import urlparse, parse_qs
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as crypto_padding
 
 if sys.version_info < (3, 8):
-    print("Error: Python 3.8 or newer is required.", file=sys.stderr)
-    sys.exit(1)
+    print("Error: Python 3.8+ required.", file=sys.stderr); sys.exit(1)
 
-# --- Paths ---
+# --- Globals ---
 SKILL_DIR = os.environ.get("SKILL_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE_FILE = os.path.join(SKILL_DIR, ".token_cache.json")
 LOG_FILE = os.path.join(SKILL_DIR, "logs", "send_wechat.log")
 CHANNEL_VERSION = "workbuddy-desktop-1.0.0"
+JSON_MODE = False  # set after parsing --json flag
 
-def _workbuddy_settings_candidates():
-    if sys.platform == "darwin":
-        return [
-            os.path.expanduser("~/.workbuddy/settings.json"),
-            os.path.expanduser("~/Library/Application Support/WorkBuddy/User/settings.json"),
-        ]
-    if sys.platform == "win32":
-        candidates = []
-        userprofile = os.environ.get("USERPROFILE")
-        if userprofile:
-            candidates.append(os.path.join(userprofile, ".workbuddy", "settings.json"))
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidates.append(os.path.join(appdata, "WorkBuddy", "User", "settings.json"))
-        if candidates:
-            return candidates
-        return [os.path.expanduser("~/AppData/Roaming/WorkBuddy/User/settings.json")]
-    return [
-        os.path.expanduser("~/.workbuddy/settings.json"),
-        os.path.expanduser("~/.config/WorkBuddy/User/settings.json"),
-    ]
+# --- Helpers ---
 
-
-def _extract_weixin_clawbot_config(settings):
-    channels = settings.get("claw.channels")
-    if not isinstance(channels, dict):
-        channels = settings.get("claw", {}).get("channels", {})
-    if not isinstance(channels, dict):
-        return {}
-    return channels.get("weixinClawBot", {})
-
-
-WORKBUDDY_SETTINGS = _workbuddy_settings_candidates()[0]
-
-
-def log(message):
-    """Append-only action log."""
+def log(msg):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{ts}\t{message}\n")
+        f.write(f"{ts}\t{msg}\n")
 
+def out(text, json_data=None, exit_code=0):
+    """Print output. In JSON mode, always output dict; in text mode, print text."""
+    if JSON_MODE:
+        d = json_data or {"message": text}
+        print(json.dumps(d, ensure_ascii=False))
+    else:
+        if text:
+            print(text)
+    if exit_code:
+        sys.exit(exit_code)
+
+def err(text, exit_code=1):
+    if JSON_MODE:
+        print(json.dumps({"error": text}, ensure_ascii=False))
+    else:
+        print(text, file=sys.stderr)
+    sys.exit(exit_code)
+
+# --- Config ---
+
+def _settings_candidates():
+    if sys.platform == "darwin":
+        return [os.path.expanduser("~/.workbuddy/settings.json"),
+                os.path.expanduser("~/Library/Application Support/WorkBuddy/User/settings.json")]
+    if sys.platform == "win32":
+        c = []
+        if os.environ.get("USERPROFILE"):
+            c.append(os.path.join(os.environ["USERPROFILE"], ".workbuddy", "settings.json"))
+        if os.environ.get("APPDATA"):
+            c.append(os.path.join(os.environ["APPDATA"], "WorkBuddy", "User", "settings.json"))
+        return c or [os.path.expanduser("~/AppData/Roaming/WorkBuddy/User/settings.json")]
+    return [os.path.expanduser("~/.workbuddy/settings.json"),
+            os.path.expanduser("~/.config/WorkBuddy/User/settings.json")]
+
+def _extract_cfg(settings):
+    channels = settings.get("claw", {}).get("channels")
+    if isinstance(channels, dict) and "weixinClawBot" in channels:
+        return channels["weixinClawBot"]
+    for uid, u in settings.get("claw", {}).get("users", {}).items():
+        if isinstance(u, dict):
+            ch = u.get("channels", {})
+            if isinstance(ch, dict) and "weixinClawBot" in ch:
+                return ch["weixinClawBot"]
+    return {}
 
 def load_config():
-    """Load ClawBot config from WorkBuddy settings."""
     errors = []
-    bot_cfg = {}
-    settings_path = None
-
-    for candidate in _workbuddy_settings_candidates():
+    for p in _settings_candidates():
         try:
-            with open(candidate, "r", encoding="utf-8-sig") as f:
-                settings = json.load(f)
+            with open(p, "r", encoding="utf-8-sig") as f:
+                s = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError) as e:
-            errors.append(f"{candidate}: {e}")
-            continue
+            errors.append(str(e)); continue
+        cfg = _extract_cfg(s)
+        if cfg.get("enabled"):
+            cfg["_settings_path"] = p
+            for k in ["botToken", "baseUrl", "userId"]:
+                if not cfg.get(k):
+                    err(f"Missing '{k}' in weixinClawBot config.")
+            return cfg
+    detail = "; ".join(errors) if errors else "weixinClawBot channel not enabled"
+    err(f"Cannot read WorkBuddy settings: {detail}")
 
-        candidate_cfg = _extract_weixin_clawbot_config(settings)
-        if candidate_cfg.get("enabled"):
-            bot_cfg = candidate_cfg
-            settings_path = candidate
-            break
-
-    if not settings_path:
-        detail = "; ".join(errors) if errors else "weixinClawBot channel is not enabled"
-        print(f"Error: Cannot read WorkBuddy settings: {detail}", file=sys.stderr)
-        sys.exit(1)
-
-    if not bot_cfg.get("enabled"):
-        print("Error: weixinClawBot channel is not enabled in WorkBuddy settings.", file=sys.stderr)
-        sys.exit(1)
-
-    required = ["botToken", "baseUrl", "userId"]
-    for key in required:
-        if not bot_cfg.get(key):
-            print(f"Error: Missing '{key}' in weixinClawBot config.", file=sys.stderr)
-            sys.exit(1)
-
-    bot_cfg["_settings_path"] = settings_path
-    return bot_cfg
-
-
-def generate_wechat_uin():
-    """Generate X-WECHAT-UIN header: random uint32 -> decimal string -> base64."""
-    rand_uint32 = int.from_bytes(os.urandom(4), "little")
-    decimal_str = str(rand_uint32)
-    return base64.b64encode(decimal_str.encode("ascii")).decode("ascii")
-
-
-def make_headers(bot_token):
-    """Build request headers for iLink API."""
-    return {
-        "Content-Type": "application/json",
-        "AuthorizationType": "ilink_bot_token",
-        "Authorization": f"Bearer {bot_token}",
-        "X-WECHAT-UIN": generate_wechat_uin(),
-    }
-
-
-def api_request(base_url, path, bot_token, payload, timeout=15):
-    """Make a POST request to the iLink API."""
-    url = f"{base_url.rstrip('/')}{path}"
-    headers = make_headers(bot_token)
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        print(f"Error: HTTP {e.code} from {path}: {error_body}", file=sys.stderr)
-        log(f"HTTP_ERROR\t{path}\t{e.code}\t{error_body[:200]}")
-        return None
-    except (urllib.error.URLError, OSError) as e:
-        reason = getattr(e, "reason", str(e))
-        print(f"Error: Network error calling {path}: {reason}", file=sys.stderr)
-        log(f"NETWORK_ERROR\t{path}\t{reason}")
-        return None
-
-
-def load_cached_token(config):
-    """Load cached context_token from disk."""
-    cache = load_cache()
-    if not cache or not cache_matches_config(cache, config):
-        return None
-    return cache.get("context_token")
-
-
-def cache_matches_config(cache, config):
-    """Return whether a cache entry belongs to the active ClawBot account."""
-    cached_account_id = cache.get("account_id")
-    if not cached_account_id:
-        return True
-    return cached_account_id == config.get("accountId")
-
+# --- Cache ---
 
 def load_cache():
-    """Load the cache file, tolerating legacy or malformed cache state."""
     if not os.path.exists(CACHE_FILE):
         return {}
     try:
@@ -178,247 +109,314 @@ def load_cache():
     except (json.JSONDecodeError, IOError):
         return {}
 
-
-def save_cached_token(token):
-    """Save context_token to disk (convenience wrapper)."""
-    save_cache(context_token=token)
-
-
-def load_getupdates_buf(config):
-    """Load the getupdates cursor from cache."""
+def save_cache(cfg=None, **kwargs):
     cache = load_cache()
-    if not cache:
-        return ""
-
-    # Legacy caches did not record account_id. Keep legacy context_token usable,
-    # but ignore legacy cursors because they can belong to a different bot and
-    # iLink may reject them with ret=-14 after WorkBuddy reconnects/migrates.
-    if not cache.get("account_id"):
-        return ""
-
-    if not cache_matches_config(cache, config):
-        return ""
-    return cache.get("get_updates_buf", "")
-
-
-def save_cache(context_token=None, get_updates_buf=None, config=None):
-    """Save context_token and/or get_updates_buf to disk."""
-    cache = load_cache()
-
-    if context_token is not None:
-        cache["context_token"] = context_token
-    if get_updates_buf is not None:
-        cache["get_updates_buf"] = get_updates_buf
-    if config is not None:
-        cache["account_id"] = config.get("accountId")
-        cache["settings_path"] = config.get("_settings_path")
+    cache.update(kwargs)
+    if cfg:
+        cache["account_id"] = cfg.get("accountId")
+        cache["settings_path"] = cfg.get("_settings_path")
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
 
-
-def refresh_token(config, retry_without_cursor=True):
-    """Fetch latest messages via getupdates to extract a fresh context_token.
-
-    getupdates is a long-polling endpoint (holds up to 35s).
-    Uses get_updates_buf as cursor for pagination.
-    """
-    buf = load_getupdates_buf(config)
-    payload = {
-        "get_updates_buf": buf,
-        "base_info": {"channel_version": CHANNEL_VERSION}
-    }
-
-    # getupdates holds connection up to 35s waiting for new messages
-    print("Polling for messages (may take up to 35 seconds)...", file=sys.stderr)
-    result = api_request(
-        config["baseUrl"], "/ilink/bot/getupdates", config["botToken"],
-        payload, timeout=45
-    )
-
-    if result is None:
-        return None
-
-    ret = result.get("ret", None)
-    if ret is not None and ret != 0:
-        print(f"Warning: getupdates returned ret={ret}", file=sys.stderr)
-        log(f"TOKEN_REFRESH_FAILED\tret={ret}")
-        if retry_without_cursor and buf:
-            print("Retrying refresh without cached get_updates_buf...", file=sys.stderr)
-            save_cache(get_updates_buf="", config=config)
-            return refresh_token(config, retry_without_cursor=False)
-        return None
-
-    # Save the new cursor for next call
-    new_buf = result.get("get_updates_buf", "")
-    if new_buf:
-        save_cache(get_updates_buf=new_buf, config=config)
-
-    # Extract context_token from messages
-    messages = result.get("msgs", [])
-
-    if messages:
-        for msg in reversed(messages):  # Most recent last
-            token = msg.get("context_token", "")
-            if token:
-                save_cache(context_token=token, config=config)
-                log(f"TOKEN_REFRESHED\t{token[:32]}...")
-                print(f"Found {len(messages)} message(s).", file=sys.stderr)
-                return token
-
-    print("Warning: No messages with context_token found.", file=sys.stderr)
-    print("Please send a message to your ClawBot in WeChat first, then run 'refresh' again.", file=sys.stderr)
-    log("TOKEN_REFRESH_FAILED\tno messages found")
+def cached_token(cfg):
+    c = load_cache()
+    if c and (not c.get("account_id") or c.get("account_id") == cfg.get("accountId")):
+        return c.get("context_token")
     return None
 
+def cached_buf(cfg):
+    c = load_cache()
+    if c and c.get("account_id") and c["account_id"] == cfg.get("accountId"):
+        return c.get("get_updates_buf", "")
+    return ""
 
-def send_message(config, text, context_token):
-    """Send a text message to the user via ClawBot.
+# --- Network ---
 
-    All fields are required per the iLink protocol spec.
-    Missing any field causes silent failure (HTTP 200 but no delivery).
-    """
-    client_id = f"workbuddy-notify-{uuid.uuid4().hex[:16]}"
+def gen_uin():
+    return base64.b64encode(str(int.from_bytes(os.urandom(4), "little")).encode()).decode()
 
-    payload = {
-        "msg": {
-            "from_user_id": "",
-            "to_user_id": config["userId"],
-            "client_id": client_id,
-            "message_type": 2,
-            "message_state": 2,
-            "context_token": context_token,
-            "item_list": [
-                {
-                    "type": 1,
-                    "text_item": {
-                        "text": text
-                    }
-                }
-            ]
-        },
-        "base_info": {
-            "channel_version": CHANNEL_VERSION
-        }
-    }
+def api_req(base_url, path, bot_token, payload, timeout=15):
+    headers = {"Content-Type": "application/json", "AuthorizationType": "ilink_bot_token",
+               "Authorization": f"Bearer {bot_token}", "X-WECHAT-UIN": gen_uin()}
+    data = json.dumps(payload, ensure_ascii=False).encode()
+    req = urllib.request.Request(f"{base_url.rstrip('/')}{path}", data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        log(f"HTTP_ERROR\t{path}\t{e.code}")
+        return {"_http_error": e.code, "_body": e.read().decode("utf-8", errors="replace")[:300]}
+    except (urllib.error.URLError, OSError) as e:
+        log(f"NETWORK_ERROR\t{path}\t{getattr(e,'reason',str(e))}")
+        return {"_network_error": str(e)}
 
-    result = api_request(config["baseUrl"], "/ilink/bot/sendmessage", config["botToken"], payload)
+# --- Crypto ---
 
-    if result is None:
-        return False
+def aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    padder = crypto_padding.PKCS7(128).padder()
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    enc = cipher.encryptor()
+    return enc.update(padder.update(data) + padder.finalize()) + enc.finalize()
 
-    # Check for errors - API may use "ret" or "errcode", or return empty {} on success
-    ret = result.get("ret", result.get("errcode", None))
+# --- Core Operations ---
+
+def refresh_token(cfg, retry_no_cursor=True):
+    buf = cached_buf(cfg)
+    result = api_req(cfg["baseUrl"], "/ilink/bot/getupdates", cfg["botToken"],
+                     {"get_updates_buf": buf, "base_info": {"channel_version": CHANNEL_VERSION}}, timeout=45)
+    if result is None or result.get("_http_error") or result.get("_network_error"):
+        return None
+
+    ret = result.get("ret")
     if ret is not None and ret != 0:
-        errmsg = result.get("errmsg", result.get("err_msg", json.dumps(result)))
-        print(f"Error: API returned ret={ret}: {errmsg}", file=sys.stderr)
-        log(f"SEND_FAILED\tret={ret}\t{errmsg}")
-        return False
+        log(f"TOKEN_REFRESH_FAILED\tret={ret}")
+        if retry_no_cursor and buf:
+            save_cache(get_updates_buf="", cfg=cfg)
+            return refresh_token(cfg, retry_no_cursor=False)
+        return None
 
+    if result.get("get_updates_buf"):
+        save_cache(get_updates_buf=result["get_updates_buf"], cfg=cfg)
+
+    for msg in reversed(result.get("msgs", [])):
+        token = msg.get("context_token", "")
+        if token:
+            save_cache(context_token=token, cfg=cfg)
+            log(f"TOKEN_REFRESHED\t{token[:32]}...")
+            return token
+    log("TOKEN_REFRESH_FAILED\tno context_token found")
+    return None
+
+def send_msg(cfg, text, token):
+    payload = {"msg": {"from_user_id": "", "to_user_id": cfg["userId"],
+                "client_id": f"wb-notify-{uuid.uuid4().hex[:16]}",
+                "message_type": 2, "message_state": 2, "context_token": token,
+                "item_list": [{"type": 1, "text_item": {"text": text}}]},
+               "base_info": {"channel_version": CHANNEL_VERSION}}
+    result = api_req(cfg["baseUrl"], "/ilink/bot/sendmessage", cfg["botToken"], payload)
+    if not result or result.get("_http_error"):
+        return False
+    r = result.get("ret", result.get("errcode"))
+    if r is not None and r != 0:
+        log(f"SEND_FAILED\tret={r}")
+        return False
     log(f"SEND_OK\t{text[:50]}")
     return True
 
+def get_upload_url(cfg, file_key, raw_size, raw_md5, enc_size, aes_hex):
+    result = api_req(cfg["baseUrl"], "/ilink/bot/getuploadurl", cfg["botToken"],
+                     {"filekey": file_key, "media_type": 3, "to_user_id": cfg["userId"],
+                      "rawsize": raw_size, "rawfilemd5": raw_md5, "filesize": enc_size,
+                      "no_need_thumb": True, "aeskey": aes_hex})
+    if not result or result.get("_http_error") or result.get("ret", 0) != 0:
+        return None, None
+
+    param = result.get("upload_param", "")
+    if param:
+        return f"https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param={param}&filekey={file_key}", param
+    url = result.get("upload_full_url", "")
+    if url:
+        q = parse_qs(urlparse(url).query)
+        ep = q.get("encrypted_query_param", [""])[0]
+        if ep:
+            return url, ep
+    return None, None
+
+def upload_cdn(upload_url, param, file_key, data):
+    url = upload_url if "encrypted_query_param=" in upload_url else f"{upload_url}?encrypted_query_param={param}&filekey={file_key}"
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            ep = r.headers.get("x-encrypted-param") or r.headers.get("X-Encrypted-Param") or ""
+            if not ep:
+                log("CDN_UPLOAD_FAILED\tno_x_encrypted_param")
+            return ep
+    except Exception as e:
+        log(f"CDN_UPLOAD_FAILED\t{e}")
+        return None
+
+def send_file_msg(cfg, token, file_path, enc_param, aes_key, raw_size):
+    aes_b64 = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
+    payload = {"msg": {"from_user_id": "", "to_user_id": cfg["userId"],
+                "client_id": f"wb-notify-{uuid.uuid4().hex[:16]}",
+                "message_type": 2, "message_state": 2, "context_token": token,
+                "item_list": [{"type": 4, "file_item": {"media": {"encrypt_query_param": enc_param,
+                    "aes_key": aes_b64, "encrypt_type": 1},
+                    "file_name": os.path.basename(file_path), "len": str(raw_size)}}]},
+               "base_info": {"channel_version": CHANNEL_VERSION}}
+    result = api_req(cfg["baseUrl"], "/ilink/bot/sendmessage", cfg["botToken"], payload)
+    if not result or result.get("ret", 0) != 0:
+        return False
+    log(f"SEND_FILE_OK\t{os.path.basename(file_path)}\t{raw_size}")
+    return True
+
+def send_file(cfg, token, file_path):
+    with open(file_path, "rb") as f:
+        data = f.read()
+    raw_size = len(data)
+    raw_md5 = hashlib.md5(data).hexdigest()
+    aes_key = os.urandom(16)
+    aes_hex = aes_key.hex()
+    enc_data = aes_ecb_encrypt(data, aes_key)
+    file_key = uuid.uuid4().hex
+
+    upload_url, param = get_upload_url(cfg, file_key, raw_size, raw_md5, len(enc_data), aes_hex)
+    if not param:
+        return False
+    ep = upload_cdn(upload_url, param, file_key, enc_data)
+    if not ep:
+        return False
+    return send_file_msg(cfg, token, file_path, ep, aes_key, raw_size)
+
+def send_with_retry(cfg, send_fn, *args):
+    """Try sending; refresh token and retry once on failure."""
+    token = cached_token(cfg)
+    if not token:
+        token = refresh_token(cfg)
+    if not token:
+        return False, "No context_token. User must send a message to ClawBot first."
+    if send_fn(cfg, token, *args):
+        return True, "ok"
+    token = refresh_token(cfg)
+    if token and send_fn(cfg, token, *args):
+        return True, "ok (after refresh)"
+    return False, "Failed after retry."
+
+# --- SOUL injection ---
+
+def inject_soul():
+    """Add auto-notify instruction to ~/.workbuddy/SOUL.md. Idempotent."""
+    soul_path = os.path.expanduser("~/.workbuddy/SOUL.md")
+    if not os.path.isfile(soul_path):
+        return "SOUL.md not found (WorkBuddy not installed?). Skipped."
+
+    with open(soul_path, "r", encoding="utf-8-sig") as f:
+        content = f.read()
+
+    marker = "## Automation Notification"
+    boundaries = "## Boundaries"
+    instruction = f"""## Automation Notification
+
+When completing an automation task, always use the `wechat-clawbot-notify` skill to send a concise result summary to the user's WeChat:
+
+```bash
+python "$SKILL_DIR/scripts/send_wechat.py" send "your summary here"
+```
+
+This ensures the user gets notified on WeChat when scheduled tasks finish, even if they are away from the computer.
+
+"""
+
+    import re
+    if marker in content:
+        pat = re.compile(rf"{re.escape(marker)}\n.*?(?=\n## |\Z)", re.DOTALL)
+        new = pat.sub(lambda _: instruction.rstrip() + "\n", content, 1)
+    elif boundaries in content:
+        new = content.replace(boundaries, instruction + boundaries)
+    else:
+        new = content.rstrip() + "\n\n" + instruction
+
+    if new == content:
+        return "Already injected. Skipped."
+    with open(soul_path, "w", encoding="utf-8") as f:
+        f.write(new)
+    return "SOUL.md updated."
+
+# --- Commands ---
+
+def cmd_setup(args):
+    """Single-step initialization: check config → get token → inject soul → send test."""
+    import subprocess
+    cfg = load_config()
+    out("Config OK.", {"status": "config_ok", "settings": cfg.get("_settings_path")})
+
+    token = cached_token(cfg)
+    if not token:
+        out("No cached token; refreshing...", {"status": "refreshing"})
+        token = refresh_token(cfg)
+        if not token:
+            out("No messages found.", {"status": "need_user_msg",
+                 "message": "Please send any message to your ClawBot in WeChat, then run setup again."})
+            return
+    out("Token ready.", {"status": "token_ok"})
+
+    soul_msg = inject_soul()
+    out(f"Soul injection: {soul_msg}", {"status": "soul_ok", "detail": soul_msg})
+
+    ok, msg = send_msg(cfg, "微信 ClawBot 通知技能配置完成！后续自动化任务完成后会自动通知你的微信。", token), ""
+    if ok:
+        out("Ready. Test message sent.", {"status": "ready", "test_message_sent": True})
+    else:
+        out("Ready (test message failed; try refresh later).", {"status": "ready", "test_message_sent": False})
 
 def cmd_send(args):
-    """Handle 'send' command."""
     if not args:
-        print("Error: No message provided. Usage: send_wechat.py send \"消息内容\"", file=sys.stderr)
-        sys.exit(1)
-
+        err("Usage: send_wechat.py send \"message\"")
+    cfg = load_config()
     text = " ".join(args)
-    config = load_config()
-
-    # Get context_token: try cache first, then refresh
-    context_token = load_cached_token(config)
-    if not context_token:
-        print("No cached context_token. Attempting to refresh...", file=sys.stderr)
-        context_token = refresh_token(config)
-        if not context_token:
-            print("Error: Cannot obtain context_token. Please send a message to your ClawBot in WeChat first.", file=sys.stderr)
-            sys.exit(1)
-
-    # Attempt to send
-    success = send_message(config, text, context_token)
-
-    if not success:
-        # Try refreshing token and retry once
-        print("Retrying with refreshed token...", file=sys.stderr)
-        context_token = refresh_token(config)
-        if context_token:
-            success = send_message(config, text, context_token)
-
-    if success:
-        print(f"Message sent successfully: {text[:80]}")
+    ok, msg = send_with_retry(cfg, send_msg, text)
+    if ok:
+        out(f"Sent: {text[:80]}", {"status": "ok", "type": "text", "text": text[:200]})
     else:
-        print("Error: Failed to send message after retry.", file=sys.stderr)
-        sys.exit(1)
+        err(f"Send failed: {msg}")
 
+def cmd_sendfile(args):
+    if not args:
+        err("Usage: send_wechat.py sendfile <path>")
+    path = args[0]
+    if not os.path.exists(path):
+        err(f"File not found: {path}")
+    cfg = load_config()
+    fn = os.path.basename(path)
+    ok, msg = send_with_retry(cfg, send_file, path)
+    if ok:
+        out(f"Sent: {fn} ({os.path.getsize(path):,} bytes)", {"status": "ok", "type": "file", "file": fn})
+    else:
+        err(f"Send failed: {msg}")
 
-def cmd_refresh(_args):
-    """Handle 'refresh' command."""
-    config = load_config()
-    token = refresh_token(config)
+def cmd_refresh(args):
+    cfg = load_config()
+    token = refresh_token(cfg)
     if token:
-        print(f"Token refreshed successfully: {token[:32]}...")
+        out("Token refreshed.", {"status": "ok", "token_prefix": token[:16]})
     else:
-        print("Failed to refresh token. Send a message to ClawBot first.", file=sys.stderr)
-        sys.exit(1)
+        err("No token found. Send a message to ClawBot first, then retry.")
 
-
-def cmd_status(_args):
-    """Handle 'status' command."""
-    config = load_config()
-    token = None
-    updated_at = "N/A"
-    cache_account_id = "N/A"
-    if os.path.exists(CACHE_FILE):
-        cache = load_cache()
-        token = cache.get("context_token")
-        updated_at = cache.get("updated_at", "N/A")
-        cache_account_id = cache.get("account_id", "legacy")
-
-    print(f"Settings:  {config.get('_settings_path', WORKBUDDY_SETTINGS)}")
-    print(f"Bot ID:    {config.get('accountId', 'N/A')}")
-    print(f"User ID:   {config['userId']}")
-    print(f"Base URL:  {config['baseUrl']}")
-    print(f"Enabled:   {config.get('enabled', False)}")
-    print(f"Ready:     {bool(token)}")
-
-    if os.path.exists(CACHE_FILE):
-        print(f"Cache Bot: {cache_account_id}")
-        if token:
-            print(f"Token:     {token[:32]}...")
-        else:
-            print("Token:     Not cached (run 'refresh' first)")
-        print(f"Updated:   {updated_at}")
+def cmd_status(args):
+    cfg = load_config()
+    cache = load_cache()
+    token = cache.get("context_token")
+    d = {"settings": cfg.get("_settings_path"), "bot_id": cfg.get("accountId", "N/A"),
+         "user_id": cfg["userId"], "base_url": cfg["baseUrl"],
+         "enabled": cfg.get("enabled", False), "ready": bool(token),
+         "token": f"{token[:16]}..." if token else None,
+         "cache_updated": cache.get("updated_at", "N/A"),
+         "cache_bot": cache.get("account_id", "legacy")}
+    if JSON_MODE:
+        out(None, d)
     else:
-        print("Token:     Not cached (run 'refresh' first)")
+        for k, v in d.items():
+            print(f"{k.replace('_',' ').title():12s} {v}")
 
-
-COMMANDS = {
-    "send": cmd_send,
-    "refresh": cmd_refresh,
-    "status": cmd_status,
-}
-
+COMMANDS = {"setup": cmd_setup, "send": cmd_send, "sendfile": cmd_sendfile,
+            "refresh": cmd_refresh, "status": cmd_status}
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
-        print(__doc__.strip())
-        print("\nCommands:")
-        print("  send <message>    Send a text message to WeChat ClawBot")
-        print("  refresh           Refresh context_token from recent messages")
-        print("  status            Show current configuration and token status")
-        sys.exit(0)
-
-    cmd = sys.argv[1]
+    global JSON_MODE
+    args = sys.argv[1:]
+    if "--json" in args:
+        JSON_MODE = True
+        args.remove("--json")
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip()); sys.exit(0)
+    cmd = args[0]
     if cmd not in COMMANDS:
-        print(f"Error: Unknown command '{cmd}'. Use 'send', 'refresh', or 'status'.", file=sys.stderr)
+        print(f"Unknown command: {cmd}. Available: {', '.join(COMMANDS)}", file=sys.stderr)
         sys.exit(1)
-
-    COMMANDS[cmd](sys.argv[2:])
-
+    COMMANDS[cmd](args[1:])
 
 if __name__ == "__main__":
     main()
